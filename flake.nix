@@ -19,16 +19,26 @@
       linux64BitSystems = [ "x86_64-linux" "aarch64-linux" ];
       linuxSystems = linux64BitSystems ++ [ "i686-linux" ];
       systems = linuxSystems ++ [ "x86_64-darwin" ];
+      crossSystems = [ "armv7l-linux" ];
 
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
+      
+      forAllCrossSystems = f: nixpkgs.lib.genAttrs crossSystems (system: f system);
 
       # Memoize nixpkgs for different platforms for efficiency.
-      nixpkgsFor = forAllSystems (system:
-        import nixpkgs {
-          inherit system;
-          overlays = [ self.overlay ];
-        }
-      );
+      nixpkgsFor = 
+        (forAllSystems (system:
+          import nixpkgs {
+            inherit system;
+            overlays = [ self.overlay ];
+          }
+        ))
+        // (forAllCrossSystems (crossSystem:
+          import nixpkgs {
+            system = "x86_64-linux";
+            inherit crossSystem;
+          }
+        ));
 
       commonDeps = pkgs: with pkgs; rec {
         # Use "busybox-sandbox-shell" if present,
@@ -270,7 +280,7 @@
         # Binary tarball for various platforms, containing a Nix store
         # with the closure of 'nix' package, and the second half of
         # the installation script.
-        binaryTarball = nixpkgs.lib.genAttrs systems (system:
+        binaryTarball = nixpkgs.lib.genAttrs (systems ++ crossSystems) (system:
 
           with nixpkgsFor.${system};
 
