@@ -31,7 +31,25 @@ jobs:
         name: '${{ env.CACHIX_NAME }}'
         signingKey: '${{ secrets.CACHIX_SIGNING_KEY }}'
         authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-    - run: nix --experimental-features 'nix-command flakes' flake check -L
+    - run: |
+        nix --experimental-features 'nix-command flakes' flake check -L
+    # only execute integration tests for linux
+    # TODO: excluded the expensive nixpkgs eval test for now
+    - if: matrix.os == 'ubuntu-latest'
+      run: |
+        nix --experimental-features 'nix-command flakes' build -L \
+          .#hydraJobs.tests.authorization \
+          .#hydraJobs.tests.containers \
+          .#hydraJobs.tests.githubFlakes \
+          .#hydraJobs.tests.nix-copy \
+          .#hydraJobs.tests.nix-copy-closure \
+          .#hydraJobs.tests.nixpkgsLibTests.x86_64-linux \
+          .#hydraJobs.tests.nssPreload \
+          .#hydraJobs.tests.remoteBuilds \
+          .#hydraJobs.tests.remoteBuildsSshNg \
+          .#hydraJobs.tests.setuid.x86_64-linux \
+          .#hydraJobs.tests.sourcehutFlakes \
+          .#hydraJobs.tests.tarballFlakes
 
   check_secrets:
     permissions:
