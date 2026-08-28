@@ -154,8 +154,13 @@ public:
 
     /**
      * Dump the contents of the specified file to a sink.
+     *
+     * @param sizeHint Expected size of the file in bytes, when known
+     * (e.g. the `FileSize` of a `.narinfo`). Lets HTTP stores fetch
+     * large files as parallel ranged chunks (see
+     * `parallel-download-chunk-size`).
      */
-    virtual void getFile(const std::string & path, Sink & sink);
+    virtual void getFile(const std::string & path, Sink & sink, std::optional<uint64_t> sizeHint = std::nullopt);
 
     /**
      * Get the contents of /nix-cache-info. Return std::nullopt if it

@@ -277,10 +277,11 @@ FileTransferRequest HttpBinaryCacheStore::makeRequest(std::string_view path)
     return request;
 }
 
-void HttpBinaryCacheStore::getFile(const std::string & path, Sink & sink)
+void HttpBinaryCacheStore::getFile(const std::string & path, Sink & sink, std::optional<uint64_t> sizeHint)
 {
     checkEnabled();
     auto request(makeRequest(path));
+    request.expectedSize = sizeHint;
     try {
         fileTransfer->download(std::move(request), sink);
     } catch (FileTransferError & e) {

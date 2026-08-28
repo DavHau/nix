@@ -35,6 +35,7 @@ subdir('nix-meson-build-support/common')
 
 sources = files(
   'derived-path.cc',
+  'http-range-server.cc',
   'https-store.cc',
   'libstore-network.cc',
   'outputs-spec.cc',

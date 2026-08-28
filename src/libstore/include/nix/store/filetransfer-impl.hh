@@ -70,4 +70,62 @@ struct RetryDelayParams
  */
 std::chrono::milliseconds computeRetryDelayMs(const RetryDelayParams & p, std::mt19937 & rng);
 
+/**
+ * Byte-range plan for a chunked (parallel ranged) download.
+ *
+ * Both fields must be nonzero. `range(i)` yields the inclusive byte
+ * range of chunk `i`, suitable for `Range: bytes=first-last`.
+ */
+struct ChunkPlan
+{
+    uint64_t fileSize;
+    uint64_t chunkSize;
+
+    struct Range
+    {
+        uint64_t first;
+        uint64_t last;
+    };
+
+    constexpr uint64_t numChunks() const
+    {
+        /* Not `(fileSize + chunkSize - 1) / chunkSize`: fileSize comes from
+           untrusted cache metadata and the addition could wrap. */
+        return fileSize / chunkSize + (fileSize % chunkSize != 0 ? 1 : 0);
+    }
+
+    constexpr Range range(uint64_t idx) const
+    {
+        auto first = idx * chunkSize;
+        return {first, std::min(first + chunkSize, fileSize) - 1};
+    }
+};
+
+/**
+ * How many additional chunks of a chunked download to dispatch right now.
+ *
+ * The in-flight window is topped up to the part of the connection pool
+ * that other transfers aren't using, and at least 1, so a chunked
+ * download always makes progress but only fans out into connection
+ * slots nothing else needs. `activeHandles` is pool-wide and includes
+ * this download's own `inFlight` chunks, which must not count as pool
+ * pressure against themselves (that would decay the window to half the
+ * pool).
+ *
+ * @param remainingChunks chunks not yet dispatched
+ * @param inFlight this download's currently running chunks
+ * @param activeHandles all currently active transfer handles in the pool
+ * @param httpConnections the `http-connections` setting (0 = unlimited)
+ */
+constexpr size_t
+chunkDispatchCount(uint64_t remainingChunks, size_t inFlight, size_t activeHandles, size_t httpConnections)
+{
+    if (httpConnections == 0)
+        return std::min<uint64_t>(remainingChunks, std::numeric_limits<size_t>::max());
+    size_t others = activeHandles > inFlight ? activeHandles - inFlight : 0;
+    size_t target = std::max<size_t>(1, httpConnections > others ? httpConnections - others : 0);
+    size_t growth = target > inFlight ? target - inFlight : 0;
+    return std::min<uint64_t>(remainingChunks, growth);
+}
+
 } // namespace nix

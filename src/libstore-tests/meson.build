@@ -64,6 +64,8 @@ sources = files(
   'derived-path.cc',
   'downstream-placeholder.cc',
   'dummy-store.cc',
+  'filetransfer-chunking.cc',
+  'filetransfer-chunked.cc',
   'filetransfer-request.cc',
   'filetransfer-retry.cc',
   'http-binary-cache-store.cc',

@@ -60,6 +60,38 @@ public:
         )",
         {"binary-caches-parallel-connections"}};
 
+    Setting<uint64_t> parallelDownloadChunkSize{
+        this,
+        0,
+        "parallel-download-chunk-size",
+        R"(
+          When set to a nonzero size (e.g. `64M`), downloads with a known
+          size larger than this value (such as NARs from a binary cache,
+          whose size is known from the `.narinfo`) are fetched as a
+          sequence of HTTP byte-range requests of this size. Range
+          requests that would otherwise sit idle in the connection pool
+          bounded by `http-connections` are issued in parallel, so a
+          single large file can saturate more than one connection. This
+          helps on links where per-connection throughput is limited.
+
+          The number of connections used for a single file adapts to how
+          busy the connection pool is: if other downloads are using the
+          pool, a chunked download uses as few as one connection, and it
+          fans out over idle connections as they become free.
+
+          Servers that don't support byte ranges (no `206 Partial
+          Content`) transparently fall back to a normal single-connection
+          download.
+
+          Note on memory use: out-of-order chunks are buffered in memory
+          until the data preceding them has been consumed, so the
+          worst-case memory use of a chunked download is roughly
+          `http-connections` times this value.
+
+          `0` (the default) disables chunked downloads. Nonzero values
+          below 1 MiB are rounded up to 1 MiB.
+        )"};
+
     /* Do not set this too low. On glibc, getaddrinfo() contains fallback code
        paths that deal with ill-behaved DNS servers. Setting this too low
        prevents some fallbacks from occurring.
@@ -254,6 +286,14 @@ struct FileTransferRequest
     bool decompress = true;
 
     /**
+     * Expected size of the response body in bytes, when known in advance
+     * (e.g. the `FileSize` from a `.narinfo`). Allows sink-based downloads
+     * of large files to be split into parallel byte-range chunks when
+     * `parallel-download-chunk-size` is set.
+     */
+    std::optional<uint64_t> expectedSize;
+
+    /**
      * Per-request retry overrides. When set, these take precedence over the
      * global `FileTransferSettings`. Typically populated from a store's URL
      * parameters (e.g. `s3://bucket?retry-attempts=8`).
@@ -367,6 +407,23 @@ struct FileTransferRequest
 
 private:
     friend struct curlFileTransfer;
+
+    /**
+     * Inclusive byte range to fetch, used by the chunked-download
+     * coordinator. Implies no transparent `Accept-Encoding` (byte ranges
+     * apply to the encoded stream) and HTTP/1.1 (concurrent ranges must
+     * each get their own TCP connection rather than being multiplexed
+     * over one).
+     */
+    std::optional<std::pair<uint64_t, uint64_t>> byteRange;
+
+    /**
+     * Invoked once, from the transfer thread, when the first body bytes
+     * of a successful response arrive: with the HTTP status, the total
+     * size parsed from `Content-Range` (206 responses only), and the
+     * response ETag (empty if none).
+     */
+    std::function<void(long httpStatus, std::optional<uint64_t> rangeTotal, const std::string & etag)> responseCallback;
 #if NIX_WITH_AWS_AUTH
     std::optional<std::string> awsSigV4Provider;
 #endif
@@ -415,6 +472,17 @@ struct FileTransfer
 protected:
     class Item
     {};
+
+    /**
+     * Hook for the chunked (parallel ranged) download implementation.
+     * Returns false when chunking is disabled or not applicable to this
+     * request, in which case the caller uses a plain streaming download.
+     */
+    virtual bool tryChunkedDownload(
+        FileTransferRequest & request, Sink & sink, std::function<void(FileTransferResult)> & resultCallback)
+    {
+        return false;
+    }
 
 public:
     /**

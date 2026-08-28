@@ -205,6 +205,18 @@ struct curlFileTransfer : public FileTransfer
         bool hasContentEncoding:1 = false;
 
         /**
+         * Whether request.responseCallback has been invoked for the
+         * current response.
+         */
+        bool responseNotified:1 = false;
+
+        /**
+         * Total object size parsed from a `Content-Range` response header
+         * (the `<total>` in `bytes <a>-<b>/<total>`), if present.
+         */
+        std::optional<uint64_t> contentRangeTotal;
+
+        /**
          * Server-provided minimum retry delay, parsed from the `Retry-After`
          * response header. Reset on each new HTTP status line, and consumed
          * (cleared) by maybeRetry() so it applies to at most one retry attempt.
@@ -244,11 +256,9 @@ struct curlFileTransfer : public FileTransfer
         }
 
         TransferItem(
-            curlFileTransfer & fileTransfer,
-            const FileTransferRequest & request,
-            Callback<FileTransferResult> && callback)
+            curlFileTransfer & fileTransfer, FileTransferRequest request, Callback<FileTransferResult> && callback)
             : fileTransfer(fileTransfer)
-            , request(request)
+            , request(std::move(request))
             , callback(std::move(callback))
             , finalSink([this](std::string_view data) {
                 if (errorSink) {
@@ -274,22 +284,25 @@ struct curlFileTransfer : public FileTransfer
                     this->result.data.append(data);
             })
         {
-            result.urls.push_back(request.uri.to_string());
+            /* NOTE: the `request` parameter is moved-from; only the member
+               (`this->request`) is valid here. */
+            result.urls.push_back(this->request.uri.to_string());
 
-            if (!request.expectedETag.empty())
-                appendHeaders("If-None-Match: " + request.expectedETag);
-            if (!request.mimeType.empty())
-                appendHeaders("Content-Type: " + request.mimeType);
-            for (auto it = request.headers.begin(); it != request.headers.end(); ++it) {
-                appendHeaders(fmt("%s: %s", it->first, it->second));
-            }
+            if (!this->request.expectedETag.empty())
+                appendHeaders("If-None-Match: " + this->request.expectedETag);
+            if (!this->request.mimeType.empty())
+                appendHeaders("Content-Type: " + this->request.mimeType);
+            for (auto & [name, value] : this->request.headers)
+                appendHeaders(fmt("%s: %s", name, value));
         }
 
         ~TransferItem()
         {
             if (req) {
-                if (active)
+                if (active) {
                     curl_multi_remove_handle(fileTransfer.curlm.get(), req);
+                    fileTransfer.activeHandles--;
+                }
                 curl_easy_cleanup(req);
             }
             try {
@@ -353,6 +366,8 @@ struct curlFileTransfer : public FileTransfer
                 errorSink = StringSink{};
             }
 
+            maybeNotifyResponse();
+
             finalSink({static_cast<const char *>(contents), realSize});
             if (paused) {
                 /* The callback has signaled that the transfer needs to be
@@ -372,6 +387,35 @@ struct curlFileTransfer : public FileTransfer
         static size_t writeCallbackWrapper(void * contents, size_t size, size_t nmemb, void * userp)
         {
             return ((TransferItem *) userp)->writeCallback(contents, size, nmemb);
+        }
+
+        /**
+         * Once per response, as soon as a successful status is known (the
+         * first body bytes, or completion for empty bodies): update
+         * range-related state and invoke request.responseCallback if set.
+         * Runs on the transfer thread.
+         */
+        void maybeNotifyResponse()
+        {
+            if (responseNotified)
+                return;
+            auto httpStatus = getHTTPStatus();
+            if (!successfulStatuses.count(httpStatus))
+                return;
+            responseNotified = true;
+            if (httpStatus == std::to_underlying(HttpStatus::PartialContent))
+                /* A 206 is direct evidence of range support, even if the
+                   server didn't send `Accept-Ranges` (needed for resuming
+                   ranged chunks after transient failures). */
+                acceptRanges = true;
+            else if (request.byteRange)
+                /* The server ignored our Range request and is sending the
+                   full body. Clear the range so any retry of this item
+                   resumes as a plain download instead of re-requesting a
+                   range the server doesn't honor. */
+                request.byteRange.reset();
+            if (request.responseCallback)
+                request.responseCallback(httpStatus, contentRangeTotal, result.etag);
         }
 
         void appendCurrentUrl()
@@ -397,6 +441,8 @@ struct curlFileTransfer : public FileTransfer
                 acceptRanges = false;
                 hasContentEncoding = false;
                 retryAfterMs = std::nullopt;
+                responseNotified = false;
+                contentRangeTotal = std::nullopt;
                 appendCurrentUrl();
             } else {
 
@@ -426,6 +472,16 @@ struct curlFileTransfer : public FileTransfer
 
                     else if (name == "accept-ranges" && toLower(trim(line.substr(i + 1))) == "bytes")
                         acceptRanges = true;
+
+                    else if (name == "content-range") {
+                        // `bytes <first>-<last>/<total>`; only the total is of
+                        // interest (sanity-checking chunked downloads).
+                        auto value = trim(line.substr(i + 1));
+                        static std::regex contentRangeRegex(
+                            "bytes +[0-9]+-[0-9]+/([0-9]+)", std::regex::extended | std::regex::icase);
+                        if (std::smatch match; std::regex_match(value, match, contentRangeRegex))
+                            contentRangeTotal = string2Int<uint64_t>(match.str(1));
+                    }
 
                     else if (name == "link" || name == "x-amz-meta-link") {
                         auto value = trim(line.substr(i + 1));
@@ -596,10 +652,11 @@ struct curlFileTransfer : public FileTransfer
             curl_easy_setopt(req, CURLOPT_URL, request.uri.to_string().c_str());
 
             /* Enable transparent decompression for downloads.
-               Skip for uploads (Accept-Encoding is meaningless when sending data)
-               and when resuming from an offset (byte ranges don't work with
-               compressed content). */
-            if (writtenToSink == 0 && !request.data)
+               Skip for uploads (Accept-Encoding is meaningless when sending data),
+               when resuming from an offset, and for ranged chunks (byte ranges
+               apply to the encoded stream, so they don't mix with transparent
+               compression). */
+            if (writtenToSink == 0 && !request.data && !request.byteRange)
                 /* Empty string means to enable all supported (that libcurl has
                    been linked to support) encodings. */
                 curl_easy_setopt(req, CURLOPT_ACCEPT_ENCODING, "");
@@ -695,7 +752,20 @@ struct curlFileTransfer : public FileTransfer
             curl_easy_setopt(req, CURLOPT_NETRC_FILE, fileTransfer.settings.netrcFile.get().string().c_str());
             curl_easy_setopt(req, CURLOPT_NETRC, CURL_NETRC_OPTIONAL);
 
-            if (writtenToSink)
+            if (request.byteRange) {
+                /* Ranged chunk of a chunked download. On retry, writtenToSink
+                   bytes of this chunk have already been consumed, so resume
+                   from there — via the range itself, never via
+                   CURLOPT_RESUME_FROM_LARGE, which would add a second,
+                   conflicting Range header. */
+                auto [first, last] = *request.byteRange;
+                curl_easy_setopt(req, CURLOPT_RANGE, fmt("%d-%d", first + writtenToSink, last).c_str());
+                /* Concurrent ranged chunks must each get their own TCP
+                   connection (and thus their own congestion window) to
+                   actually increase throughput; HTTP/2 would multiplex them
+                   onto a single connection. */
+                curl_easy_setopt(req, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+            } else if (writtenToSink)
                 curl_easy_setopt(req, CURLOPT_RESUME_FROM_LARGE, writtenToSink);
 
             /* Note that the underlying strings get copied by libcurl, so the path -> string conversion is ok:
@@ -780,6 +850,7 @@ struct curlFileTransfer : public FileTransfer
                 curl_off_t dlSize = 0;
                 curl_easy_getinfo(req, CURLINFO_SIZE_DOWNLOAD_T, &dlSize);
                 act().progress(dlSize, dlSize);
+                maybeNotifyResponse();
                 done = true;
                 callback(std::move(result));
             }
@@ -999,13 +1070,24 @@ struct curlFileTransfer : public FileTransfer
     public:
         bool work = false;
 
-        void quit()
+        /**
+         * Stop accepting requests and drain the queue. The drained items
+         * are RETURNED rather than destroyed here: destroying a queued
+         * item runs its failure callback, and callbacks must never run
+         * under the state lock (a chunked-download callback may re-enter
+         * enqueueItem()).
+         */
+        [[nodiscard]] std::vector<ref<TransferItem>> quit()
         {
             quitting = true;
             /* We will not be processing any more incoming requests */
-            while (!incoming.empty())
+            std::vector<ref<TransferItem>> dropped;
+            while (!incoming.empty()) {
+                dropped.push_back(incoming.top());
                 incoming.pop();
+            }
             unpause.clear();
+            return dropped;
         }
 
         bool isQuitting()
@@ -1015,6 +1097,13 @@ struct curlFileTransfer : public FileTransfer
     };
 
     Sync<State> state_;
+
+    /**
+     * Number of transfers currently added to the curl multi handle.
+     * Maintained by the worker thread; read by chunked downloads to
+     * estimate idle connection-pool slots.
+     */
+    std::atomic<size_t> activeHandles{0};
 
     std::thread workerThread;
 
@@ -1045,10 +1134,14 @@ struct curlFileTransfer : public FileTransfer
 
     void stopWorkerThread()
     {
-        /* Signal the worker thread to exit. */
-        auto state(state_.lock());
-        state->quit();
-        wakeupMulti(*state);
+        std::vector<ref<TransferItem>> dropped;
+        {
+            /* Signal the worker thread to exit. */
+            auto state(state_.lock());
+            dropped = state->quit();
+            wakeupMulti(*state);
+        }
+        /* Destroyed outside the lock: this fails the items' callbacks. */
     }
 
     void wakeupMulti(State & state)
@@ -1096,6 +1189,10 @@ struct curlFileTransfer : public FileTransfer
                 if (msg->msg == CURLMSG_DONE) {
                     auto i = items.find(msg->easy_handle);
                     assert(i != items.end());
+                    /* Decrement before finish(): its callback may compute
+                       idle slots for a chunked download's fan-out, and this
+                       handle no longer occupies a slot. */
+                    activeHandles--;
                     i->second->finish(msg->data.result);
                     curl_multi_remove_handle(curlm.get(), i->second->req);
                     i->second->active = false;
@@ -1140,6 +1237,7 @@ struct curlFileTransfer : public FileTransfer
                 item->init();
                 curl_multi_add_handle(curlm.get(), item->req);
                 item->active = true;
+                activeHandles++;
                 items[item->req] = item;
             }
 
@@ -1195,8 +1293,12 @@ struct curlFileTransfer : public FileTransfer
         }
 
         if (!normalExit) {
-            auto state(state_.lock());
-            state->quit();
+            std::vector<ref<TransferItem>> dropped;
+            {
+                auto state(state_.lock());
+                dropped = state->quit();
+            }
+            /* Destroyed outside the lock: this fails the items' callbacks. */
         }
     }
 
@@ -1242,6 +1344,387 @@ struct curlFileTransfer : public FileTransfer
         /* The transfer might have completed (more likely failed) when we want
            to wake it up. That's why we must use a weak_ptr throughout. */
         unpauseTransfer(handle.item);
+    }
+
+    /**
+     * Shared state and callbacks of one chunked (parallel ranged)
+     * download. The sink-feeding drain loop runs on the caller's thread
+     * (see downloadChunked()); all callbacks run on the transfer thread.
+     *
+     * Kept alive by the per-chunk callbacks, so it outlives the caller
+     * when the caller unwinds with chunks still in flight.
+     */
+    struct ChunkedDownload : std::enable_shared_from_this<ChunkedDownload>
+    {
+        curlFileTransfer & ft;
+        const FileTransferRequest baseRequest;
+        const ChunkPlan plan;
+
+        struct State
+        {
+            /** The caller is gone or the transfer failed; drop further data. */
+            bool quit = false;
+
+            /** First failure; rethrown by the drain loop. */
+            std::exception_ptr exc;
+
+            /** In-order bytes ready for the sink. */
+            std::string drainBuf;
+
+            /** Whether the head chunk paused because drainBuf ran full. */
+            bool headPaused = false;
+
+            /** Lowest incomplete chunk; its bytes stream straight to drainBuf. */
+            uint64_t headChunk = 0;
+
+            /** Out-of-order buffers of chunks ahead of the head. */
+            std::map<uint64_t, std::string> reorder;
+
+            /** Finished chunks the head hasn't been advanced past yet. */
+            std::set<uint64_t> completed;
+
+            /** Handles of in-flight chunks, for unpausing the head. */
+            std::map<uint64_t, std::weak_ptr<Item>> handles;
+
+            /** Bytes received per in-flight or completed chunk. */
+            std::map<uint64_t, uint64_t> received;
+
+            /** Whether the server ignored the Range probe (plain download). */
+            bool fallback = false;
+
+            uint64_t nextToDispatch = 0;
+            uint64_t chunksDone = 0;
+            size_t inFlight = 0;
+
+            /** Effective chunk count; drops to 1 on fallback to a plain download. */
+            uint64_t chunksTotal;
+
+            /** Whether chunk 0's 206-vs-200 verdict has arrived. */
+            bool verdict = false;
+
+            /** ETag of chunk 0's response; later chunks send If-Match. */
+            std::string etag;
+
+            /** Result of chunk 0, for the resultCallback. */
+            std::optional<FileTransferResult> firstResult;
+
+            std::condition_variable avail;
+        };
+
+        Sync<State> state_;
+
+        ChunkedDownload(curlFileTransfer & ft, FileTransferRequest && baseRequest, const ChunkPlan & plan)
+            : ft(ft)
+            , baseRequest(std::move(baseRequest))
+            , plan(plan)
+        {
+            state_.lock()->chunksTotal = plan.numChunks();
+        }
+
+        /**
+         * Advance the head past finished chunks, splicing their buffered
+         * bytes into drainBuf in order. Must be called with the state lock
+         * held.
+         */
+        void promote(State & state)
+        {
+            while (state.completed.count(state.headChunk)) {
+                state.completed.erase(state.headChunk);
+                state.headChunk++;
+                /* Any pause belonged to the chunk we just advanced past. */
+                state.headPaused = false;
+                if (auto it = state.reorder.find(state.headChunk); it != state.reorder.end()) {
+                    state.drainBuf.append(it->second);
+                    state.reorder.erase(it);
+                }
+            }
+        }
+
+        /**
+         * Top up the in-flight window with however many idle connection
+         * slots the pool has right now. Must be called with the state lock
+         * held.
+         */
+        void topUp(State & state)
+        {
+            if (state.quit || !state.verdict)
+                return;
+            auto n = chunkDispatchCount(
+                state.chunksTotal - state.nextToDispatch,
+                state.inFlight,
+                ft.activeHandles.load(),
+                ft.settings.httpConnections);
+            try {
+                while (n--)
+                    dispatch(state.nextToDispatch++, state);
+            } catch (...) {
+                /* enqueueItem() can throw during shutdown. */
+                if (!state.exc)
+                    state.exc = std::current_exception();
+                state.quit = true;
+            }
+        }
+
+        /**
+         * Enqueue chunk `i`. Must be called with the state lock held.
+         */
+        void dispatch(uint64_t i, State & state)
+        {
+            auto chunkReq = baseRequest;
+            auto range = plan.range(i);
+            chunkReq.byteRange = {{range.first, range.last}};
+            if (i == 0)
+                /* Chunk 0 doubles as the range-support probe. */
+                chunkReq.responseCallback =
+                    [self = shared_from_this()](
+                        long httpStatus, std::optional<uint64_t> rangeTotal, const std::string & etag) {
+                        self->onResponse(httpStatus, rangeTotal, etag);
+                    };
+            else if (!state.etag.empty() && !state.etag.starts_with("W/"))
+                /* Guard against the object changing between chunks. (Weak
+                   etags never match under If-Match's strong comparison, so
+                   sending one would always fail.) */
+                chunkReq.headers.emplace_back("If-Match", state.etag);
+            chunkReq.dataCallback = [self = shared_from_this(), i](std::string_view data) {
+                return self->onData(i, data);
+            };
+            state.inFlight++;
+            auto handle = ft.enqueueItem(
+                make_ref<TransferItem>(
+                    ft,
+                    std::move(chunkReq),
+                    Callback<FileTransferResult>([self = shared_from_this(), i](std::future<FileTransferResult> fut) {
+                        self->onDone(i, std::move(fut));
+                    })));
+            state.handles[i] = handle.item;
+        }
+
+        /**
+         * Number of bytes chunk `i` is allowed to deliver. Must be called
+         * with the state lock held.
+         */
+        uint64_t expectedChunkBytes(const State & state, uint64_t i) const
+        {
+            /* After the 200 fallback, chunk 0's response is the whole file. */
+            if (state.fallback && i == 0)
+                return plan.fileSize;
+            auto range = plan.range(i);
+            return range.last - range.first + 1;
+        }
+
+        PauseTransfer onData(uint64_t i, std::string_view data)
+        {
+            auto state(state_.lock());
+            if (state->quit)
+                return PauseTransfer::No;
+
+            /* Bound what a chunk may deliver. This keeps the reorder
+               buffers bounded by the chunk size even against a server
+               that answers a ranged request with more data than asked
+               for (e.g. a 200 with the full body on a non-probe chunk),
+               and turns such responses into a hard error instead of a
+               corrupt stream. */
+            auto & received = state->received[i];
+            received += data.size();
+            if (received > expectedChunkBytes(*state, i)) {
+                if (!state->exc)
+                    state->exc = std::make_exception_ptr(
+                        nix::Error(
+                            "chunked download of '%s' failed: server sent more data than requested for bytes %d-%d",
+                            baseRequest.displayUri(),
+                            plan.range(i).first,
+                            plan.range(i).last));
+                state->quit = true;
+                state->avail.notify_one();
+                return PauseTransfer::No;
+            }
+
+            if (i == state->headChunk) {
+                state->drainBuf.append(data);
+                state->avail.notify_one();
+                if (state->drainBuf.size() > ft.settings.downloadBufferSize) {
+                    state->headPaused = true;
+                    return PauseTransfer::Yes;
+                }
+            } else
+                /* Out-of-order data, bounded by the chunk size above; the
+                   window bounds how many chunks are in flight. */
+                state->reorder[i].append(data);
+            return PauseTransfer::No;
+        }
+
+        void onResponse(long httpStatus, std::optional<uint64_t> rangeTotal, const std::string & etag)
+        {
+            auto state(state_.lock());
+            if (state->verdict || state->quit)
+                return;
+            state->verdict = true;
+            if (httpStatus == std::to_underlying(HttpStatus::PartialContent)) {
+                if (rangeTotal && *rangeTotal != plan.fileSize) {
+                    state->exc = std::make_exception_ptr(
+                        nix::Error(
+                            "chunked download of '%s' failed: expected a file of %d bytes, but the server reports %d bytes",
+                            baseRequest.displayUri(),
+                            plan.fileSize,
+                            *rangeTotal));
+                    state->quit = true;
+                } else {
+                    state->etag = etag;
+                    topUp(*state);
+                }
+            } else {
+                /* The server ignored the Range request and is sending the
+                   whole body over this connection; consume it as a plain
+                   download. (TransferItem has already cleared byteRange so
+                   retries resume linearly.) */
+                debug(
+                    "server of '%s' does not support byte ranges, falling back to a regular download",
+                    baseRequest.displayUri());
+                state->fallback = true;
+                state->chunksTotal = 1;
+            }
+            state->avail.notify_one();
+        }
+
+        void onDone(uint64_t i, std::future<FileTransferResult> fut)
+        {
+            auto state(state_.lock());
+            state->inFlight--;
+            state->chunksDone++;
+            state->handles.erase(i);
+            try {
+                auto res = fut.get();
+                /* received[] accumulates across retry-resumes of the same
+                   chunk; res.bodySize would only cover the last attempt. */
+                if (state->received[i] != expectedChunkBytes(*state, i))
+                    throw nix::Error(
+                        "chunked download of '%s' failed: server sent %d bytes for bytes %d-%d",
+                        baseRequest.displayUri(),
+                        state->received[i],
+                        plan.range(i).first,
+                        plan.range(i).last);
+                if (i == 0)
+                    state->firstResult = std::move(res);
+                else if (!state->etag.empty() && !res.etag.empty() && res.etag != state->etag)
+                    /* Server ignored (or couldn't evaluate) If-Match, but the
+                       ETag shows the object changed while we were fetching
+                       ranges of it. */
+                    throw nix::Error(
+                        "chunked download of '%s' failed: file changed on the server while it was being downloaded",
+                        baseRequest.displayUri());
+                state->completed.insert(i);
+                promote(*state);
+                topUp(*state);
+            } catch (...) {
+                if (!state->exc)
+                    state->exc = std::current_exception();
+                state->quit = true;
+            }
+            state->avail.notify_one();
+        }
+    };
+
+    bool tryChunkedDownload(
+        FileTransferRequest & request, Sink & sink, std::function<void(FileTransferResult)> & resultCallback) override
+    {
+        if (!settings.parallelDownloadChunkSize)
+            return false;
+        if (request.method != HttpMethod::Get || request.data)
+            return false;
+        auto chunkSize = std::max<uint64_t>(settings.parallelDownloadChunkSize, 1024 * 1024);
+        if (chunkSize != settings.parallelDownloadChunkSize) {
+            static std::atomic<bool> haveWarned = false;
+            warnOnce(
+                haveWarned,
+                "rounding 'parallel-download-chunk-size' (%d) up to 1 MiB",
+                settings.parallelDownloadChunkSize.get());
+        }
+        if (!request.expectedSize || *request.expectedSize <= chunkSize)
+            return false;
+        auto fileSize = *request.expectedSize;
+
+        if (request.uri.scheme() == "s3")
+            request.setupForS3();
+
+        downloadChunked(
+            std::make_shared<ChunkedDownload>(
+                *this, std::move(request), ChunkPlan{.fileSize = fileSize, .chunkSize = chunkSize}),
+            sink,
+            resultCallback);
+        return true;
+    }
+
+    /**
+     * Drain loop of a chunked download: feed in-order bytes to the sink on
+     * the calling thread, unpause the head chunk when the buffer empties,
+     * finish when every chunk is done.
+     */
+    void downloadChunked(
+        std::shared_ptr<ChunkedDownload> dl, Sink & sink, std::function<void(FileTransferResult)> & resultCallback)
+    {
+        /* On unwind (exception in the sink, interrupt), tell the chunk
+           callbacks to drop further data, and unpause a paused head chunk —
+           nothing would ever unpause it otherwise, permanently occupying a
+           connection slot. In-flight chunks then drain to completion in the
+           background (their data is discarded), holding `dl` alive. */
+        Finally finally([&]() {
+            std::optional<std::weak_ptr<Item>> toUnpause;
+            {
+                auto state(dl->state_.lock());
+                state->quit = true;
+                if (state->headPaused) {
+                    state->headPaused = false;
+                    if (auto it = state->handles.find(state->headChunk); it != state->handles.end())
+                        toUnpause = it->second;
+                }
+            }
+            if (toUnpause)
+                unpauseTransfer(*toUnpause);
+        });
+
+        {
+            auto state(dl->state_.lock());
+            dl->dispatch(state->nextToDispatch++, *state);
+        }
+
+        while (true) {
+            checkInterrupt();
+
+            std::string chunk;
+
+            {
+                auto state(dl->state_.lock());
+
+                while (state->drainBuf.empty()) {
+                    if (state->exc)
+                        std::rethrow_exception(state->exc);
+
+                    if (state->chunksDone >= state->chunksTotal) {
+                        if (resultCallback && state->firstResult) {
+                            /* Present the result as one logical download. */
+                            state->firstResult->bodySize = dl->plan.fileSize;
+                            resultCallback(std::move(*state->firstResult));
+                        }
+                        return;
+                    }
+
+                    if (state->headPaused) {
+                        state->headPaused = false;
+                        if (auto it = state->handles.find(state->headChunk); it != state->handles.end())
+                            unpauseTransfer(it->second);
+                    }
+
+                    state.wait(state->avail);
+                }
+
+                chunk = std::move(state->drainBuf);
+                state->drainBuf.clear();
+            }
+
+            /* Flush to the sink without holding the lock, so the transfer
+               thread isn't blocked by an expensive sink. */
+            sink(chunk);
+        }
     }
 };
 
@@ -1353,6 +1836,9 @@ FileTransferResult FileTransfer::deleteResource(const FileTransferRequest & requ
 void FileTransfer::download(
     FileTransferRequest && request, Sink & sink, std::function<void(FileTransferResult)> resultCallback)
 {
+    if (tryChunkedDownload(request, sink, resultCallback))
+        return;
+
     /* Note: we can't call 'sink' via request.dataCallback, because
        that would cause the sink to execute on the fileTransfer
        thread. If 'sink' is a coroutine, this will fail. Also, if the
