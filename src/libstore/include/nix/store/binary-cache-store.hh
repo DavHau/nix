@@ -2,6 +2,7 @@
 ///@file
 
 #include "nix/util/compression-settings.hh"
+#include "nix/store/filetransfer.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/log-store.hh"
 
@@ -155,12 +156,13 @@ public:
     /**
      * Dump the contents of the specified file to a sink.
      *
-     * @param sizeHint Expected size of the file in bytes, when known
-     * (e.g. the `FileSize` of a `.narinfo`). Lets HTTP stores fetch
-     * large files as parallel ranged chunks (see
+     * @param chunked Set for large static objects (NARs), with their
+     * size when the `.narinfo` provides one. Lets HTTP stores fetch
+     * them as parallel ranged chunks (see
      * `parallel-download-chunk-size`).
      */
-    virtual void getFile(const std::string & path, Sink & sink, std::optional<uint64_t> sizeHint = std::nullopt);
+    virtual void
+    getFile(const std::string & path, Sink & sink, std::optional<ChunkedDownloadHint> chunked = std::nullopt);
 
     /**
      * Get the contents of /nix-cache-info. Return std::nullopt if it

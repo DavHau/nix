@@ -293,7 +293,7 @@ void HttpRangeServer::handleConnection(int fd)
                     auto [first, last] = *range;
                     status = 206;
                     extraHeaders += "Content-Range: bytes " + std::to_string(first) + "-" + std::to_string(last) + "/"
-                                    + std::to_string(contents.size()) + "\r\n";
+                                    + (behavior.omitRangeTotal ? "*" : std::to_string(contents.size())) + "\r\n";
                     body = std::string_view{contents}.substr(first, last - first + 1);
                 } else {
                     status = 416;

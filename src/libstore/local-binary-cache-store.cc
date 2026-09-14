@@ -87,7 +87,7 @@ protected:
         del.cancel();
     }
 
-    void getFile(const std::string & path, Sink & sink, std::optional<uint64_t> sizeHint) override
+    void getFile(const std::string & path, Sink & sink, std::optional<ChunkedDownloadHint> chunked) override
     {
         try {
             /* TODO: Don't follow symlinks? */

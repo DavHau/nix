@@ -153,7 +153,7 @@ protected:
         std::string_view mimeType,
         std::optional<Headers> headers);
 
-    void getFile(const std::string & path, Sink & sink, std::optional<uint64_t> sizeHint) override;
+    void getFile(const std::string & path, Sink & sink, std::optional<ChunkedDownloadHint> chunked) override;
 
     void getFile(const std::string & path, Callback<std::optional<std::string>> callback) noexcept override;
 

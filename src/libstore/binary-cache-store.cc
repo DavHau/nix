@@ -98,7 +98,7 @@ void BinaryCacheStore::getFile(const std::string & path, Callback<std::optional<
     }
 }
 
-void BinaryCacheStore::getFile(const std::string & path, Sink & sink, std::optional<uint64_t> sizeHint)
+void BinaryCacheStore::getFile(const std::string & path, Sink & sink, std::optional<ChunkedDownloadHint> chunked)
 {
     std::promise<std::optional<std::string>> promise;
     getFile(path, {[&](std::future<std::optional<std::string>> result) {
@@ -574,7 +574,10 @@ void BinaryCacheStore::narFromPath(const StorePath & storePath, Sink & sink)
     auto decompressor = makeDecompressionSink(info->compression.value_or(CompressionAlgo::none), uncompressedSink);
 
     try {
-        getFile(info->url, *decompressor, info->fileSize ? std::optional(info->fileSize) : std::nullopt);
+        getFile(
+            info->url,
+            *decompressor,
+            ChunkedDownloadHint{.expectedSize = info->fileSize ? std::optional(info->fileSize) : std::nullopt});
     } catch (NoSuchBinaryCacheFile & e) {
         throw SubstituteGone(std::move(e.info()));
     }

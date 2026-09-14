@@ -65,10 +65,12 @@ public:
         0,
         "parallel-download-chunk-size",
         R"(
-          When set to a nonzero size (e.g. `64M`), downloads with a known
-          size larger than this value (such as NARs from a binary cache,
-          whose size is known from the `.narinfo`) are fetched as a
-          sequence of HTTP byte-range requests of this size. Range
+          When set to a nonzero size (e.g. `64M`), NARs from binary caches
+          larger than this value are fetched as a sequence of HTTP
+          byte-range requests of this size. The size is taken from the
+          `.narinfo` (`FileSize`); if the cache doesn't provide one, the
+          first range request doubles as a probe and the rest are planned
+          from the server's `Content-Range` total. Range
           requests that would otherwise sit idle in the connection pool
           bounded by `http-connections` are issued in parallel, so a
           single large file can saturate more than one connection. This
@@ -276,6 +278,25 @@ enum class PauseTransfer : bool {
     Yes = true,
 };
 
+/**
+ * Marks a download as a large static object that may be fetched as
+ * parallel byte-range chunks when `parallel-download-chunk-size` is
+ * set. Only appropriate for immutable, idempotently served objects
+ * such as binary cache NARs: ranged requests forgo transparent
+ * `Accept-Encoding`, and an empty object answers a range probe with
+ * `416`.
+ */
+struct ChunkedDownloadHint
+{
+    /**
+     * Size of the object in bytes, when known in advance (e.g. the
+     * `FileSize` from a `.narinfo`). When unknown, the first chunk
+     * doubles as a size probe: the remaining chunks are planned from
+     * the `Content-Range` total of its `206` response.
+     */
+    std::optional<uint64_t> expectedSize;
+};
+
 struct FileTransferRequest
 {
     VerbatimURL uri;
@@ -286,12 +307,10 @@ struct FileTransferRequest
     bool decompress = true;
 
     /**
-     * Expected size of the response body in bytes, when known in advance
-     * (e.g. the `FileSize` from a `.narinfo`). Allows sink-based downloads
-     * of large files to be split into parallel byte-range chunks when
-     * `parallel-download-chunk-size` is set.
+     * Set for sink-based downloads eligible for chunked (parallel
+     * ranged) transfer.
      */
-    std::optional<uint64_t> expectedSize;
+    std::optional<ChunkedDownloadHint> chunked;
 
     /**
      * Per-request retry overrides. When set, these take precedence over the

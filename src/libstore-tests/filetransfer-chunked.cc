@@ -44,7 +44,7 @@ struct ChunkedDownloadFixture
     {
         auto ft = makeFileTransfer(settings);
         FileTransferRequest request(VerbatimURL{server.url(path)});
-        request.expectedSize = expectedSize;
+        request.chunked = ChunkedDownloadHint{.expectedSize = expectedSize};
         StringSink sink;
         ft->download(std::move(request), sink);
         return std::move(sink.s);
@@ -125,18 +125,67 @@ TEST(ChunkedDownload, disabledSettingIsNotChunked)
     EXPECT_EQ(countRanged(reqs), 0u);
 }
 
-TEST(ChunkedDownload, unknownSizeIsNotChunked)
+TEST(ChunkedDownload, unknownSizeIsPlannedFromProbe)
 {
     ChunkedDownloadFixture fx;
-    auto body = makeBody(3 * MiB);
-    HttpRangeServer server{{{"/big", body}}};
+    auto body = makeBody(3 * MiB + 777);
+    HttpRangeServer server{{{"/big", body}}, {.etag = "\"v1\""}};
 
+    /* No size hint (e.g. a .narinfo without FileSize): chunk 0 doubles as
+       a size probe and the remaining chunks are planned from the
+       Content-Range total of its 206. */
     auto fetched = fx.fetch(server, "/big", std::nullopt);
 
     EXPECT_EQ(fetched, body);
     auto reqs = server.requests();
-    EXPECT_EQ(reqs.size(), 1u);
-    EXPECT_EQ(countRanged(reqs), 0u);
+    EXPECT_EQ(reqs.size(), 4u);
+    EXPECT_EQ(countRanged(reqs), 4u);
+    EXPECT_EQ(reqs[0].rangeHeader, std::optional<std::string>("bytes=0-1048575"));
+    for (auto & r : reqs)
+        if (r.rangeHeader != "bytes=0-1048575")
+            EXPECT_EQ(r.ifMatchHeader, std::optional<std::string>("\"v1\""));
+}
+
+TEST(ChunkedDownload, unknownSizeSmallFileIsOneProbe)
+{
+    ChunkedDownloadFixture fx;
+    auto body = makeBody(MiB / 2);
+    HttpRangeServer server{{{"/small", body}}};
+
+    /* The probe's 206 already covers the whole file: no further requests. */
+    auto fetched = fx.fetch(server, "/small", std::nullopt);
+
+    EXPECT_EQ(fetched, body);
+    EXPECT_EQ(server.requests().size(), 1u);
+}
+
+TEST(ChunkedDownload, unknownSizeFallsBackWhenServerIgnoresRanges)
+{
+    ChunkedDownloadFixture fx;
+    auto body = makeBody(3 * MiB);
+    HttpRangeServer server{{{"/big", body}}, {.supportRanges = false, .advertiseRanges = false}};
+
+    auto fetched = fx.fetch(server, "/big", std::nullopt);
+
+    EXPECT_EQ(fetched, body);
+    EXPECT_EQ(server.requests().size(), 1u);
+}
+
+TEST(ChunkedDownload, unknownSizeWithoutRangeTotalIsDownloadedPlainly)
+{
+    ChunkedDownloadFixture fx;
+    auto body = makeBody(3 * MiB);
+    HttpRangeServer server{{{"/big", body}}, {.omitRangeTotal = true}};
+
+    /* A 206 with `bytes a-b/\*` gives nothing to plan the remaining chunks
+       from: the probe is abandoned and the file fetched unchunked. */
+    auto fetched = fx.fetch(server, "/big", std::nullopt);
+
+    EXPECT_EQ(fetched, body);
+    auto reqs = server.requests();
+    ASSERT_EQ(reqs.size(), 2u);
+    EXPECT_TRUE(reqs[0].rangeHeader.has_value());
+    EXPECT_FALSE(reqs[1].rangeHeader.has_value());
 }
 
 TEST(ChunkedDownload, sizeMismatchAborts)
@@ -255,7 +304,14 @@ TEST(ChunkedDownload, weakEtagSkipsIfMatch)
         EXPECT_EQ(r.ifMatchHeader, std::nullopt);
 }
 
-TEST(ChunkedDownload, narFromPathIsChunkedEndToEnd)
+/**
+ * Substitute a > 1 chunk NAR through HttpBinaryCacheStore::narFromPath and
+ * check that the NAR itself (not the narinfo or cache-info) was fetched as
+ * ranged chunks. `withFileSize` controls whether the .narinfo carries
+ * `FileHash`/`FileSize`; caches that omit them must be chunked via the
+ * size probe instead.
+ */
+static void narFromPathIsChunked(bool withFileSize)
 {
     ChunkedDownloadFixture fx;
 
@@ -278,15 +334,14 @@ TEST(ChunkedDownload, narFromPathIsChunkedEndToEnd)
         fmt("StorePath: %s/%s\n"
             "URL: nar/test.nar\n"
             "Compression: none\n"
-            "FileHash: %s\n"
-            "FileSize: %d\n"
+            "%s"
             "NarHash: %s\n"
             "NarSize: %d\n"
             "References: \n",
             storeDir,
             pathName,
-            narHash.to_string(HashFormat::Nix32, true),
-            nar.size(),
+            withFileSize ? fmt("FileHash: %s\nFileSize: %d\n", narHash.to_string(HashFormat::Nix32, true), nar.size())
+                         : std::string{},
             narHash.to_string(HashFormat::Nix32, true),
             nar.size());
 
@@ -308,6 +363,16 @@ TEST(ChunkedDownload, narFromPathIsChunkedEndToEnd)
        narinfo and cache-info were not. */
     size_t ranged = countRanged(server.requests());
     EXPECT_EQ(ranged, (nar.size() + MiB - 1) / MiB);
+}
+
+TEST(ChunkedDownload, narFromPathIsChunkedEndToEnd)
+{
+    narFromPathIsChunked(true);
+}
+
+TEST(ChunkedDownload, narFromPathWithoutFileSizeIsChunkedEndToEnd)
+{
+    narFromPathIsChunked(false);
 }
 
 } // namespace nix

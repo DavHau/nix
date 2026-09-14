@@ -23,6 +23,9 @@ struct RangeServerBehavior
     std::string etag;
     /** Whether to advertise `Accept-Ranges: bytes`. */
     bool advertiseRanges = true;
+    /** Send `Content-Range: bytes a-b/\*` (unknown total) on 206 responses,
+        as some dynamically generated content does. */
+    bool omitRangeTotal = false;
     /** Called with the 1-based request ordinal before handling; return an HTTP
         status (e.g. 500) to short-circuit with an empty error body, or nullopt
         to handle normally. Used for transient-failure injection. */
