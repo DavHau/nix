@@ -304,6 +304,61 @@ TEST(ChunkedDownload, weakEtagSkipsIfMatch)
         EXPECT_EQ(r.ifMatchHeader, std::nullopt);
 }
 
+/* Regression: cache.nixos-cuda.org (Caddy) answers `Range: bytes=0-8388607`
+   with `200`, `Content-Range: bytes 0-8388607/<total>` and exactly the
+   requested bytes. That is a partial response despite the status; treating
+   it as a full-body 200 failed with "server sent 8388608 bytes for bytes
+   0-8388607". */
+TEST(ChunkedDownload, partialContentSentAs200IsAccepted)
+{
+    ChunkedDownloadFixture fx;
+    auto body = makeBody(3 * MiB + 4321);
+    HttpRangeServer server{{{"/big", body}}, {.partialStatus = 200}};
+
+    auto fetched = fx.fetch(server, "/big", body.size());
+
+    EXPECT_EQ(fetched, body);
+    auto reqs = server.requests();
+    EXPECT_EQ(reqs.size(), 4u);
+    EXPECT_EQ(countRanged(reqs), 4u);
+}
+
+TEST(ChunkedDownload, unknownSizePartialContentSentAs200IsPlannedFromProbe)
+{
+    ChunkedDownloadFixture fx;
+    auto body = makeBody(3 * MiB + 4321);
+    HttpRangeServer server{{{"/big", body}}, {.partialStatus = 200}};
+
+    auto fetched = fx.fetch(server, "/big", std::nullopt);
+
+    EXPECT_EQ(fetched, body);
+    EXPECT_EQ(countRanged(server.requests()), 4u);
+}
+
+TEST(ChunkedDownload, partialContentSentAs200ResumesChunk)
+{
+    ChunkedDownloadFixture fx;
+    auto body = makeBody(3 * MiB);
+    RangeServerBehavior behavior;
+    behavior.partialStatus = 200;
+    /* Cut the probe; its retry asks for a narrowed range whose 200 must
+       still be recognized as partial. */
+    behavior.truncateAfter = [](size_t ordinal) -> std::optional<size_t> {
+        if (ordinal == 1)
+            return 1000;
+        return std::nullopt;
+    };
+    HttpRangeServer server{{{"/big", body}}, behavior};
+
+    auto fetched = fx.fetch(server, "/big", body.size());
+    EXPECT_EQ(fetched, body);
+    auto reqs = server.requests();
+    EXPECT_EQ(reqs.size(), 4u);
+    EXPECT_TRUE(std::ranges::any_of(reqs, [](auto & r) {
+        return r.rangeHeader == std::optional<std::string>("bytes=1000-1048575");
+    }));
+}
+
 /**
  * Substitute a > 1 chunk NAR through HttpBinaryCacheStore::narFromPath and
  * check that the NAR itself (not the narinfo or cache-info) was fetched as

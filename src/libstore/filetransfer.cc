@@ -211,9 +211,11 @@ struct curlFileTransfer : public FileTransfer
         bool responseNotified:1 = false;
 
         /**
-         * Total object size parsed from a `Content-Range` response header
-         * (the `<total>` in `bytes <a>-<b>/<total>`), if present.
+         * First offset and total object size parsed from a `Content-Range`
+         * response header (`bytes <first>-<last>/<total>`), if present. The
+         * total is absent for `bytes <first>-<last>/\*`.
          */
+        std::optional<uint64_t> contentRangeFirst;
         std::optional<uint64_t> contentRangeTotal;
 
         /**
@@ -403,6 +405,15 @@ struct curlFileTransfer : public FileTransfer
             if (!successfulStatuses.count(httpStatus))
                 return;
             responseNotified = true;
+            if (httpStatus == std::to_underlying(HttpStatus::Ok) && request.byteRange
+                && contentRangeFirst == request.byteRange->first + static_cast<uint64_t>(writtenToSink))
+                /* Some servers (e.g. Caddy in front of cache.nixos-cuda.org)
+                   answer a satisfiable Range request with `200`, but a
+                   `Content-Range` starting where we asked and only the
+                   requested bytes. Despite the status that is a partial
+                   response; taking it for the full body would make the
+                   chunked download expect the whole file from it. */
+                httpStatus = std::to_underlying(HttpStatus::PartialContent);
             if (httpStatus == std::to_underlying(HttpStatus::PartialContent))
                 /* A 206 is direct evidence of range support, even if the
                    server didn't send `Accept-Ranges` (needed for resuming
@@ -442,6 +453,7 @@ struct curlFileTransfer : public FileTransfer
                 hasContentEncoding = false;
                 retryAfterMs = std::nullopt;
                 responseNotified = false;
+                contentRangeFirst = std::nullopt;
                 contentRangeTotal = std::nullopt;
                 appendCurrentUrl();
             } else {
@@ -474,13 +486,16 @@ struct curlFileTransfer : public FileTransfer
                         acceptRanges = true;
 
                     else if (name == "content-range") {
-                        // `bytes <first>-<last>/<total>`; only the total is of
-                        // interest (sanity-checking chunked downloads).
+                        // `bytes <first>-<last>/<total>`: the first offset
+                        // identifies partial responses, the total sanity-checks
+                        // and plans chunked downloads.
                         auto value = trim(line.substr(i + 1));
                         static std::regex contentRangeRegex(
-                            "bytes +[0-9]+-[0-9]+/([0-9]+)", std::regex::extended | std::regex::icase);
-                        if (std::smatch match; std::regex_match(value, match, contentRangeRegex))
-                            contentRangeTotal = string2Int<uint64_t>(match.str(1));
+                            "bytes +([0-9]+)-[0-9]+/([0-9]+|\\*)", std::regex::extended | std::regex::icase);
+                        if (std::smatch match; std::regex_match(value, match, contentRangeRegex)) {
+                            contentRangeFirst = string2Int<uint64_t>(match.str(1));
+                            contentRangeTotal = string2Int<uint64_t>(match.str(2));
+                        }
                     }
 
                     else if (name == "link" || name == "x-amz-meta-link") {

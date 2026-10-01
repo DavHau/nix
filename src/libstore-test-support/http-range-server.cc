@@ -291,7 +291,7 @@ void HttpRangeServer::handleConnection(int fd)
             if (behavior.supportRanges && req.rangeHeader) {
                 if (auto range = parseRange(*req.rangeHeader, contents.size())) {
                     auto [first, last] = *range;
-                    status = 206;
+                    status = behavior.partialStatus;
                     extraHeaders += "Content-Range: bytes " + std::to_string(first) + "-" + std::to_string(last) + "/"
                                     + (behavior.omitRangeTotal ? "*" : std::to_string(contents.size())) + "\r\n";
                     body = std::string_view{contents}.substr(first, last - first + 1);

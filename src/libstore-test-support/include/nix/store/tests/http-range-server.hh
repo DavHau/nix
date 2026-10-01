@@ -26,6 +26,10 @@ struct RangeServerBehavior
     /** Send `Content-Range: bytes a-b/\*` (unknown total) on 206 responses,
         as some dynamically generated content does. */
     bool omitRangeTotal = false;
+    /** Status code of successful ranged responses. Some servers (e.g. Caddy
+        in front of cache.nixos-cuda.org) answer a satisfiable Range request
+        with `200` plus `Content-Range` and only the requested bytes. */
+    int partialStatus = 206;
     /** Called with the 1-based request ordinal before handling; return an HTTP
         status (e.g. 500) to short-circuit with an empty error body, or nullopt
         to handle normally. Used for transient-failure injection. */
