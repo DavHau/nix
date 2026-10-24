@@ -1382,18 +1382,21 @@ struct curlFileTransfer : public FileTransfer
         curlFileTransfer & ft;
         const FileTransferRequest baseRequest;
 
+        /** Untrusted size claim (e.g. a `.narinfo`'s `FileSize`); only logged on mismatch. */
+        const std::optional<uint64_t> sizeHint;
+
         struct State
         {
             /**
-             * Byte-range plan. With an unknown size it initially covers
-             * a single probe chunk and is replanned from the probe's
-             * `Content-Range` total (or, on a `200` fallback, from the
-             * delivered body) once that is known.
+             * Byte-range plan. It initially covers a single probe chunk
+             * and is replanned from the probe's `Content-Range` total (or,
+             * on a `200` fallback, from the delivered body) once that is
+             * known.
              */
             ChunkPlan plan;
 
-            /** Whether plan.fileSize is the real object size. */
-            bool sizeKnown;
+            /** Whether plan.fileSize is the real object size, as reported by the server. */
+            bool sizeKnown = false;
 
             /** The caller is gone or the transfer failed; drop further data. */
             bool quit = false;
@@ -1449,16 +1452,17 @@ struct curlFileTransfer : public FileTransfer
         ChunkedDownload(
             curlFileTransfer & ft,
             FileTransferRequest && baseRequest,
-            std::optional<uint64_t> fileSize,
+            std::optional<uint64_t> sizeHint,
             uint64_t chunkSize)
             : ft(ft)
             , baseRequest(std::move(baseRequest))
+            , sizeHint(sizeHint)
         {
             auto state(state_.lock());
-            state->sizeKnown = fileSize.has_value();
-            /* Unknown size: plan exactly the probe chunk; the rest follows
-               once its response reveals the total. */
-            state->plan = ChunkPlan{.fileSize = fileSize.value_or(chunkSize), .chunkSize = chunkSize};
+            /* Plan exactly the probe chunk; the rest follows once its
+               response reveals the total. The size hint is not used: cache
+               metadata has been observed to disagree with the served file. */
+            state->plan = ChunkPlan{.fileSize = chunkSize, .chunkSize = chunkSize};
             state->chunksTotal = state->plan.numChunks();
         }
 
@@ -1602,31 +1606,24 @@ struct curlFileTransfer : public FileTransfer
                 return;
             state->verdict = true;
             if (httpStatus == std::to_underlying(HttpStatus::PartialContent)) {
-                if (!state->sizeKnown) {
-                    if (!rangeTotal || *rangeTotal == 0) {
-                        /* `bytes a-b/\*`: nothing to plan the remaining chunks
-                           from (a total of 0 is nonsense for a 206). */
-                        debug(
-                            "server of '%s' did not report the object's size, falling back to a regular download",
-                            baseRequest.displayUri());
-                        state->exc = std::make_exception_ptr(ChunkedDownloadUnplannable{});
-                        state->quit = true;
-                    } else {
-                        state->plan.fileSize = *rangeTotal;
-                        state->sizeKnown = true;
-                        state->chunksTotal = state->plan.numChunks();
-                        state->etag = etag;
-                        topUp(*state);
-                    }
-                } else if (rangeTotal && *rangeTotal != state->plan.fileSize) {
-                    state->exc = std::make_exception_ptr(
-                        nix::Error(
-                            "chunked download of '%s' failed: expected a file of %d bytes, but the server reports %d bytes",
-                            baseRequest.displayUri(),
-                            state->plan.fileSize,
-                            *rangeTotal));
+                if (!rangeTotal || *rangeTotal == 0) {
+                    /* `bytes a-b/\*`: nothing to plan the remaining chunks
+                       from (a total of 0 is nonsense for a 206). */
+                    debug(
+                        "server of '%s' did not report the object's size, falling back to a regular download",
+                        baseRequest.displayUri());
+                    state->exc = std::make_exception_ptr(ChunkedDownloadUnplannable{});
                     state->quit = true;
                 } else {
+                    if (sizeHint && *sizeHint != *rangeTotal)
+                        debug(
+                            "'%s' is %d bytes according to the server, not %d as claimed by its metadata",
+                            baseRequest.displayUri(),
+                            *rangeTotal,
+                            *sizeHint);
+                    state->plan.fileSize = *rangeTotal;
+                    state->sizeKnown = true;
+                    state->chunksTotal = state->plan.numChunks();
                     state->etag = etag;
                     topUp(*state);
                 }
@@ -1652,7 +1649,7 @@ struct curlFileTransfer : public FileTransfer
             state->handles.erase(i);
             try {
                 auto res = fut.get();
-                if (i == 0 && state->fallback && !state->sizeKnown) {
+                if (i == 0 && state->fallback) {
                     /* The whole body came down the probe connection; its
                        length is the size. */
                     state->plan.fileSize = state->received[i];
@@ -1703,27 +1700,28 @@ struct curlFileTransfer : public FileTransfer
                 "rounding 'parallel-download-chunk-size' (%d) up to 1 MiB",
                 settings.parallelDownloadChunkSize.get());
         }
-        auto fileSize = request.chunked->expectedSize;
-        if (fileSize && *fileSize <= chunkSize)
+        /* The size hint is untrusted, but a wrong one only costs
+           parallelism here: a file that's really larger gets a plain
+           streaming download. */
+        auto sizeHint = request.chunked->expectedSize;
+        if (sizeHint && *sizeHint <= chunkSize)
             return false;
 
-        /* With an unknown size the probe may turn out unplannable, in
-           which case the caller proceeds with a plain download of the
-           (untouched) original request. */
-        std::optional<FileTransferRequest> original;
-        if (!fileSize)
-            original = request;
+        /* The probe may turn out unplannable, in which case the caller
+           proceeds with a plain download of the (untouched) original
+           request. */
+        auto original = request;
 
         if (request.uri.scheme() == "s3")
             request.setupForS3();
 
         try {
             downloadChunked(
-                std::make_shared<ChunkedDownload>(*this, std::move(request), fileSize, chunkSize),
+                std::make_shared<ChunkedDownload>(*this, std::move(request), sizeHint, chunkSize),
                 sink,
                 resultCallback);
         } catch (ChunkedDownloadUnplannable &) {
-            request = std::move(*original);
+            request = std::move(original);
             return false;
         }
         return true;

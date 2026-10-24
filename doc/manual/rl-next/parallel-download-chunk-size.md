@@ -6,9 +6,11 @@ prs: []
 Downloads of single large files from binary caches can now use multiple
 HTTP connections. When the new `parallel-download-chunk-size` setting is set
 to a nonzero size (e.g. `64M`), NARs exceeding that size are fetched as
-parallel HTTP byte-range requests. The size comes from the `.narinfo`
-(`FileSize`); caches that omit it are handled by using the first range
-request as a size probe.
+parallel HTTP byte-range requests. The first range request doubles as a
+size probe and the remaining ranges are planned from the size the server
+reports. The `.narinfo`'s `FileSize` and `FileHash` are not trusted (caches
+have been observed to serve files that differ from them); integrity is
+guaranteed by the `NarHash` check of the unpacked NAR.
 
 This helps on links where per-connection throughput is limited: substitution
 already downloads many *paths* in parallel, but a single large NAR at the

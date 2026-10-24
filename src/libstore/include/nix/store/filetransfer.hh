@@ -67,10 +67,12 @@ public:
         R"(
           When set to a nonzero size (e.g. `64M`), NARs from binary caches
           larger than this value are fetched as a sequence of HTTP
-          byte-range requests of this size. The size is taken from the
-          `.narinfo` (`FileSize`); if the cache doesn't provide one, the
-          first range request doubles as a probe and the rest are planned
-          from the server's `Content-Range` total. Range
+          byte-range requests of this size. The first range request
+          doubles as a size probe; the rest are planned from the server's
+          `Content-Range` total. The `.narinfo`'s `FileSize` is only used
+          to skip chunking for files it claims are small: it is not
+          trusted, as caches have been observed to serve files of a
+          different size. Range
           requests that would otherwise sit idle in the connection pool
           bounded by `http-connections` are issued in parallel, so a
           single large file can saturate more than one connection. This
@@ -82,8 +84,8 @@ public:
           fans out over idle connections as they become free.
 
           Servers that don't support byte ranges (no `206 Partial
-          Content`) transparently fall back to a normal single-connection
-          download.
+          Content`) or don't report the file's size transparently fall
+          back to a normal single-connection download.
 
           Note on memory use: out-of-order chunks are buffered in memory
           until the data preceding them has been consumed, so the
@@ -289,10 +291,12 @@ enum class PauseTransfer : bool {
 struct ChunkedDownloadHint
 {
     /**
-     * Size of the object in bytes, when known in advance (e.g. the
-     * `FileSize` from a `.narinfo`). When unknown, the first chunk
-     * doubles as a size probe: the remaining chunks are planned from
-     * the `Content-Range` total of its `206` response.
+     * Size of the object in bytes as claimed by untrusted metadata
+     * (e.g. the `FileSize` from a `.narinfo`). Only used to skip
+     * chunking for objects that are claimed to fit in one chunk; the
+     * chunk plan always comes from the server: the first chunk doubles
+     * as a size probe, and the remaining chunks are planned from the
+     * `Content-Range` total of its response.
      */
     std::optional<uint64_t> expectedSize;
 };

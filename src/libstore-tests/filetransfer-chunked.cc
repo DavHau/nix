@@ -6,8 +6,10 @@
 #  include <gtest/gtest.h>
 
 #  include "nix/store/filetransfer.hh"
+#  include "nix/store/local-store.hh"
 #  include "nix/store/tests/http-range-server.hh"
 #  include "nix/store/tests/https-store.hh"
+#  include "nix/util/file-system.hh"
 #  include "nix/util/archive.hh"
 #  include "nix/util/serialise.hh"
 
@@ -188,15 +190,42 @@ TEST(ChunkedDownload, unknownSizeWithoutRangeTotalIsDownloadedPlainly)
     EXPECT_FALSE(reqs[1].rangeHeader.has_value());
 }
 
-TEST(ChunkedDownload, sizeMismatchAborts)
+/* The size hint (a .narinfo's FileSize) is untrusted: cache.nixos.org has
+   served NARs a few bytes off from their FileSize. Chunks must be planned
+   from the server's Content-Range total, in either direction of error. */
+TEST(ChunkedDownload, wrongSizeHintIsIgnored)
 {
-    ChunkedDownloadFixture fx;
-    auto body = makeBody(3 * MiB);
-    HttpRangeServer server{{{"/big", body}}};
+    auto body = makeBody(3 * MiB + 4321);
+    for (uint64_t hint : {body.size() - 7, uint64_t{MiB + 1}, body.size() + 7, uint64_t{10 * MiB}}) {
+        SCOPED_TRACE(hint);
+        ChunkedDownloadFixture fx;
+        HttpRangeServer server{{{"/big", body}}, {.etag = "\"v1\""}};
 
-    /* The cache metadata claims a different size than the server reports in
-       Content-Range: refuse to assemble a corrupt stream. */
-    EXPECT_THROW(fx.fetch(server, "/big", body.size() + 1000), Error);
+        auto fetched = fx.fetch(server, "/big", hint);
+
+        EXPECT_EQ(fetched, body);
+        auto reqs = server.requests();
+        EXPECT_EQ(reqs.size(), 4u);
+        EXPECT_EQ(countRanged(reqs), 4u);
+        EXPECT_TRUE(std::ranges::any_of(reqs, [&](auto & r) {
+            return r.rangeHeader == "bytes=" + std::to_string(3 * MiB) + "-" + std::to_string(body.size() - 1);
+        }));
+    }
+}
+
+TEST(ChunkedDownload, wrongSizeHintFallsBackWhenServerIgnoresRanges)
+{
+    auto body = makeBody(3 * MiB);
+    for (uint64_t hint : {body.size() - 7, body.size() + 7}) {
+        SCOPED_TRACE(hint);
+        ChunkedDownloadFixture fx;
+        HttpRangeServer server{{{"/big", body}}, {.supportRanges = false, .advertiseRanges = false}};
+
+        auto fetched = fx.fetch(server, "/big", hint);
+
+        EXPECT_EQ(fetched, body);
+        EXPECT_EQ(server.requests().size(), 1u);
+    }
 }
 
 TEST(ChunkedDownload, transientChunkFailureIsRetried)
@@ -359,14 +388,23 @@ TEST(ChunkedDownload, partialContentSentAs200ResumesChunk)
     }));
 }
 
+struct NarInfoFileFields
+{
+    /** Added to the real file size; nullopt omits FileSize and FileHash. */
+    std::optional<int64_t> fileSizeError = 0;
+    /** Whether FileHash is the hash of something else. */
+    bool wrongFileHash = false;
+};
+
 /**
- * Substitute a > 1 chunk NAR through HttpBinaryCacheStore::narFromPath and
- * check that the NAR itself (not the narinfo or cache-info) was fetched as
- * ranged chunks. `withFileSize` controls whether the .narinfo carries
- * `FileHash`/`FileSize`; caches that omit them must be chunked via the
- * size probe instead.
+ * Substitute a > 1 chunk NAR from an HTTP binary cache into a local store
+ * and check that the NAR itself (not the narinfo or cache-info) was
+ * fetched as ranged chunks, planned from the real size. `FileSize` and
+ * `FileHash` in the .narinfo are untrusted hints: whether absent or wrong,
+ * substitution must succeed, the NarHash check of the local store being
+ * what guarantees integrity.
  */
-static void narFromPathIsChunked(bool withFileSize)
+static void substituteChunked(NarInfoFileFields fields)
 {
     ChunkedDownloadFixture fx;
 
@@ -385,6 +423,7 @@ static void narFromPathIsChunked(bool withFileSize)
     auto hashPart = narHash.to_string(HashFormat::Nix32, false).substr(0, 32);
     auto pathName = hashPart + "-chunked-test";
 
+    auto fileHash = fields.wrongFileHash ? hashString(HashAlgorithm::SHA256, "not the nar") : narHash;
     auto narInfo =
         fmt("StorePath: %s/%s\n"
             "URL: nar/test.nar\n"
@@ -395,8 +434,10 @@ static void narFromPathIsChunked(bool withFileSize)
             "References: \n",
             storeDir,
             pathName,
-            withFileSize ? fmt("FileHash: %s\nFileSize: %d\n", narHash.to_string(HashFormat::Nix32, true), nar.size())
-                         : std::string{},
+            fields.fileSizeError ? fmt("FileHash: %s\nFileSize: %d\n",
+                                       fileHash.to_string(HashFormat::Nix32, true),
+                                       static_cast<int64_t>(nar.size()) + *fields.fileSizeError)
+                                 : std::string{},
             narHash.to_string(HashFormat::Nix32, true),
             nar.size());
 
@@ -410,24 +451,45 @@ static void narFromPathIsChunked(bool withFileSize)
     auto store = config->openTestStore(ft);
     store->init();
 
-    StringSink fetched;
-    store->narFromPath(StorePath(pathName), fetched);
+    AutoDelete root(canonPath(createTempDir(), /*resolveSymlinks=*/true));
+    auto localConfig = make_ref<LocalStoreConfig>(root.path().string(), StoreConfig::Params{});
+    ASSERT_EQ(localConfig->storeDir, storeDir);
+    auto localStore = make_ref<LocalStore>(localConfig);
 
-    EXPECT_EQ(fetched.s, nar);
+    StorePath path(pathName);
+    copyStorePath(*store, *localStore, path, NoRepair, NoCheckSigs);
+
+    auto info = localStore->queryPathInfo(path);
+    EXPECT_EQ(info->narHash, narHash);
+    EXPECT_EQ(info->narSize, nar.size());
     /* The NAR itself (3 requests of 1 MiB + change) was fetched chunked;
        narinfo and cache-info were not. */
     size_t ranged = countRanged(server.requests());
     EXPECT_EQ(ranged, (nar.size() + MiB - 1) / MiB);
 }
 
-TEST(ChunkedDownload, narFromPathIsChunkedEndToEnd)
+TEST(ChunkedDownload, substitutionIsChunkedEndToEnd)
 {
-    narFromPathIsChunked(true);
+    substituteChunked({});
 }
 
-TEST(ChunkedDownload, narFromPathWithoutFileSizeIsChunkedEndToEnd)
+TEST(ChunkedDownload, substitutionWithoutFileSizeIsChunkedEndToEnd)
 {
-    narFromPathIsChunked(false);
+    substituteChunked({.fileSizeError = std::nullopt});
+}
+
+/* Regression: cache.nixos.org serves some NARs whose size and hash differ
+   from the FileSize/FileHash of their .narinfo (e.g.
+   39lyf5g2iz4jd2r6q4g5whk9vw09zglj.narinfo claims 9064108 bytes for a
+   9064101-byte .nar.zst). */
+TEST(ChunkedDownload, substitutionWithTooSmallFileSizeSucceeds)
+{
+    substituteChunked({.fileSizeError = -7, .wrongFileHash = true});
+}
+
+TEST(ChunkedDownload, substitutionWithTooLargeFileSizeSucceeds)
+{
+    substituteChunked({.fileSizeError = 7, .wrongFileHash = true});
 }
 
 } // namespace nix

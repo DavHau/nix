@@ -63,16 +63,26 @@ single-stream; a chunk is an ordinary `TransferItem` with a `Range` header.
 ### Eligibility (all must hold)
 
 - `fileTransferSettings.parallelDownloadChunkSize > 0`
-- `request.expectedSize` is set and `> chunkSize`
+- the size hint (`ChunkedDownloadHint::expectedSize`) is absent or `> chunkSize`
 - method is GET, no upload data
 - sink-based path (`download(request, sink)`), not `enqueueFileTransfer`
 
 Otherwise: existing sequential path, untouched.
 
-`FileTransferRequest` gains `std::optional<uint64_t> expectedSize`. Only
-`BinaryCacheStore::narFromPath` sets it today, from `NarInfo::fileSize`
-(already fetched via `queryPathInfo` before the NAR download starts; a cache
-that omits `FileSize` yields `fileSize == 0` → hint absent → sequential).
+`FileTransferRequest` gains `std::optional<ChunkedDownloadHint> chunked`.
+Only `BinaryCacheStore::narFromPath` sets it today, with
+`expectedSize` from `NarInfo::fileSize` (absent when the cache omits
+`FileSize`).
+
+`FileSize` is an untrusted hint: cache.nixos.org has been observed serving
+NARs whose size and hash differ from the narinfo's `FileSize`/`FileHash`
+(e.g. `39lyf5g2iz4jd2r6q4g5whk9vw09zglj.narinfo`: `FileSize: 9064108`,
+served 9064101 bytes). The hint only decides eligibility (skip chunking
+small files); a wrong hint at worst costs parallelism. The chunk plan always
+comes from the server: chunk 0 is a size probe and the remaining chunks are
+planned from the `Content-Range` total of its response. Integrity rests on
+the `NarHash`/`NarSize` check of the decompressed NAR when it is added to
+the store; `FileHash` is never checked.
 
 ### Chunk plan and adaptive window
 
@@ -131,11 +141,12 @@ so nothing is lost.
 - **Server ignores `Range`** (200 instead of 206 on chunk 0): the response
   is the full body — keep streaming it as a normal sequential download,
   dispatch no further chunks. No error, no extra requests, no wasted bytes.
-  The body must still match `expectedSize` exactly; a mismatch is an error.
-- **206 sanity check**: total size from `Content-Range` must equal
-  `expectedSize`; mismatch aborts with a clear error (cache metadata wrong —
-  fail loudly rather than truncate). Each chunk must deliver exactly its
-  range's byte count, checked at chunk completion.
+  Its length is whatever the server sends; the size hint is not enforced.
+- **No usable size**: a 206 without a `Content-Range` total (`bytes a-b/*`)
+  abandons the probe and refetches the file as a plain download.
+- **Size hint mismatch**: a `Content-Range` total differing from the hint is
+  logged at debug level and otherwise ignored. Each chunk must deliver
+  exactly its range's byte count, checked at chunk completion.
 - **Transient chunk failure**: per-chunk retry via the existing
   `maybeRetry` machinery (backoff, `filetransfer-retry-attempts`),
   unchanged; a partially delivered chunk resumes with a narrowed `Range`
@@ -171,11 +182,11 @@ so nothing is lost.
   out-of-order completion; 200 fallback with no extra requests; ETag
   mismatch abort; weak-etag If-Match skip; chunk retry after injected
   transient failure; mid-body disconnect with narrowed-Range resume;
-  end-to-end `narFromPath` chunking through a served binary cache
-  (narinfo `FileSize` → chunked NAR fetch), which supersedes the shell
-  functional test originally planned here (no Range-capable server exists
-  in `tests/functional/`, and the C++ test covers the same store-level
-  path deterministically).
+  end-to-end substitution into a local store through a served binary cache
+  with correct, missing, too-small and too-large narinfo `FileSize` (and a
+  wrong `FileHash`), which supersedes the shell functional test originally
+  planned here (no Range-capable server exists in `tests/functional/`, and
+  the C++ test covers the same store-level path deterministically).
 - **Docs**: setting description carries the memory formula; release note
   entry.
 
